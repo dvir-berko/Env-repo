@@ -1,0 +1,134 @@
+name: Create new repo when PR is merged
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]   # change if your env-repo default branch is different
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  create_repo:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Parse repo request from PR body
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BODY_FILE="$(mktemp)"
+          cat > "$BODY_FILE" <<'EOF'
+          ${{ github.event.pull_request.body }}
+          EOF
+
+          # Helper to extract "key: value" (first match)
+          get_val () {
+            local key="$1"
+            grep -iE "^[[:space:]]*${key}[[:space:]]*:" "$BODY_FILE" | head -n1 | sed -E "s/^[[:space:]]*${key}[[:space:]]*:[[:space:]]*//I" | tr -d '\r'
+          }
+
+          REPO_NAME="$(get_val repo_name || true)"
+          DESCRIPTION="$(get_val description || true)"
+          VISIBILITY="$(get_val visibility || true)"
+          ORG="$(get_val org || true)"
+          TEMPLATE_REPO="$(get_val template_repo || true)"
+
+          # Basic validation
+          if [[ -z "${REPO_NAME}" ]]; then
+            echo "ERROR: repo_name is required in PR body."
+            exit 1
+          fi
+
+          # normalize
+          VISIBILITY="$(echo "${VISIBILITY:-private}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$VISIBILITY" != "private" && "$VISIBILITY" != "public" ]]; then
+            echo "ERROR: visibility must be private|public"
+            exit 1
+          fi
+
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "description=$DESCRIPTION" >> "$GITHUB_OUTPUT"
+          echo "visibility=$VISIBILITY" >> "$GITHUB_OUTPUT"
+          echo "org=$ORG" >> "$GITHUB_OUTPUT"
+          echo "template_repo=$TEMPLATE_REPO" >> "$GITHUB_OUTPUT"
+
+      # You need a token that is allowed to create repos.
+      # - For user repos: fine-grained PAT with "Administration: Read and write" (and repo creation enabled)
+      # - For org repos: PAT must be allowed in the org and have rights to create repos in that org.
+      - name: Create repository (from template if provided)
+        env:
+          GH_TOKEN: ${{ secrets.REPO_CREATOR_TOKEN }}
+          REPO_NAME: ${{ steps.parse.outputs.repo_name }}
+          DESCRIPTION: ${{ steps.parse.outputs.description }}
+          VISIBILITY: ${{ steps.parse.outputs.visibility }}
+          ORG: ${{ steps.parse.outputs.org }}
+          TEMPLATE_REPO: ${{ steps.parse.outputs.template_repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRIVATE=true
+          if [[ "$VISIBILITY" == "public" ]]; then PRIVATE=false; fi
+
+          auth_header="Authorization: Bearer ${GH_TOKEN}"
+          api="https://api.github.com"
+          accept="Accept: application/vnd.github+json"
+          version="X-GitHub-Api-Version: 2022-11-28"
+
+          # Decide endpoint:
+          # - With template_repo: POST /repos/{template_owner}/{template_repo}/generate
+          # - Without template: create empty repo
+          if [[ -n "${TEMPLATE_REPO}" ]]; then
+            template_owner="$(echo "$TEMPLATE_REPO" | cut -d/ -f1)"
+            template_name="$(echo "$TEMPLATE_REPO" | cut -d/ -f2)"
+
+            # generate to org or user
+            if [[ -n "${ORG}" ]]; then
+              payload=$(jq -n \
+                --arg name "$REPO_NAME" \
+                --arg desc "$DESCRIPTION" \
+                --arg owner "$ORG" \
+                --argjson private "$PRIVATE" \
+                '{name:$name, description:$desc, owner:$owner, private:$private, include_all_branches:false}')
+            else
+              payload=$(jq -n \
+                --arg name "$REPO_NAME" \
+                --arg desc "$DESCRIPTION" \
+                --argjson private "$PRIVATE" \
+                '{name:$name, description:$desc, private:$private, include_all_branches:false}')
+            fi
+
+            echo "Creating repo from template ${TEMPLATE_REPO} ..."
+            curl -sSf -X POST \
+              -H "$auth_header" -H "$accept" -H "$version" \
+              "${api}/repos/${template_owner}/${template_name}/generate" \
+              -d "$payload" | jq -r '.html_url'
+          else
+            # create empty repo
+            if [[ -n "${ORG}" ]]; then
+              payload=$(jq -n \
+                --arg name "$REPO_NAME" \
+                --arg desc "$DESCRIPTION" \
+                --argjson private "$PRIVATE" \
+                '{name:$name, description:$desc, private:$private}')
+              endpoint="${api}/orgs/${ORG}/repos"
+            else
+              payload=$(jq -n \
+                --arg name "$REPO_NAME" \
+                --arg desc "$DESCRIPTION" \
+                --argjson private "$PRIVATE" \
+                '{name:$name, description:$desc, private:$private}')
+              endpoint="${api}/user/repos"
+            fi
+
+            echo "Creating empty repo ..."
+            curl -sSf -X POST \
+              -H "$auth_header" -H "$accept" -H "$version" \
+              "$endpoint" \
+              -d "$payload" | jq -r '.html_url'
+          fi
